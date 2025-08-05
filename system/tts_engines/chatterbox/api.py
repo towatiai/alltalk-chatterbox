@@ -320,7 +320,7 @@ def vc(
     print(f"Using device: {device}")
 
     model = get_model_vc(model_name="just_a_placeholder", device=device)
-    progress(0.1, desc="Converting audio...")
+    progress(0.1, desc="Converting audio...") 
     wav = model.generate(
         audio=audio_in,
         target_voice_path=audio_ref,

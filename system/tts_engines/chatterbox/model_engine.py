@@ -8,6 +8,7 @@ import time
 import torch
 import torchaudio
 import logging
+import numpy as np
 from pathlib import Path
 from fastapi import (HTTPException)
 logging.disable(logging.WARNING)
@@ -120,6 +121,10 @@ class tts_class:
         self.params = configfile_data                                                                       # Loads in the curent "confgnew.json" file to self.params.
         self.debug_tts = configfile_data.get("debugging").get("debug_tts")                                  # Can be used within this script as a True/False flag for generally debugging the TTS generation process. 
         self.debug_tts_variables = configfile_data.get("debugging").get("debug_tts_variables")              # Can be used within this script as a True/False flag for generally debugging variables (if you wish).
+
+        self.previous_voice = None
+        self.previous_exaggaration = None
+
     ################################################################
     # DONT CHANGE #  Print out Python, CUDA, DeepSpeed versions ####
     ################################################################
@@ -233,11 +238,24 @@ class tts_class:
         # ↑↑↑ Keep everything above this line ↑↑↑
         # ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
         
-        self.available_models = { "pretrained": "pretrained" }
+        self.available_models = { "pretrained": "chatterbox" }
 
+        models_dir = self.main_dir / "models" / "chatterbox"
 
+        if not models_dir.exists():
+            print(f"[{self.branding}ENG] \033[91mWarning\033[0m: Models directory not found: {models_dir}")
+            return self.available_models
 
+        for subdir in models_dir.iterdir():
+            if subdir.is_dir():
+                required_files = ["s3gen.safetensors", "t3_cfg.safetensors", "ve.safetensors", "tokenizer.json"]
+                if not all((subdir / f).exists() for f in required_files):
+                    print(f"[{self.branding}ENG] \033[91mWarning\033[0m: Missing required files in model directory: {subdir}")
+                    continue
 
+                self.available_models[subdir.name] = "chatterbox"
+
+        print(f"[{self.branding}ENG] \033[92mModels Found\033[0m: {self.available_models}")
         
         # ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
         # ↓↓↓ Keep everything below this line ↓↓↓
@@ -263,10 +281,16 @@ class tts_class:
             # ↑↑↑ Keep everything above this line ↑↑↑
             # ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ 
 
+            if (os.path.exists(self.model_path / "wavs")):
+                print(f"Finetuned voices found in {self.model_path}")
+                directory = self.model_path / "wavs"
+            else:
+                directory = self.main_dir / "voices"
 
 
+            voices.extend([f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f)) and f.endswith(".wav")])
 
-
+            voices.sort(key=lambda f: os.path.getsize(os.path.join(directory, f)), reverse=True)
 
 
 
@@ -304,11 +328,19 @@ class tts_class:
         device = torch.device("cuda")
         dtype = torch.float32
 
-        self.model = ChatterboxTTS.from_pretrained(device=device)
+        self.model_path = self.main_dir / "models" / "chatterbox" / model_name
+
+        print(self.model_path)
+        if model_name and model_name != "pretrained" and model_name != "No Models Found":
+            self.model = ChatterboxTTS.from_local(self.model_path, device=device)
+        else:
+            self.model = ChatterboxTTS.from_pretrained(device=device)
         
         self.model.ve.to(device=device)
+        
         self.model.t3.to(dtype=dtype)
-        self.model.conds.t3.to(dtype=dtype)
+        if self.model.conds is not None:
+            self.model.conds.t3.to(dtype=dtype)
         self.model.s3gen.to(dtype=dtype)
         self.model.s3gen.mel2wav.to(dtype=torch.float32)
         self.model.s3gen.tokenizer.to(dtype=torch.float32)
@@ -316,7 +348,19 @@ class tts_class:
         
         self.model.device = device
 
+        # if not hasattr(self.model.t3, "_step_compilation_target_original"):
+        #     self.model.t3._step_compilation_target_original = self.model.t3._step_compilation_target
+        self.model.t3._step_compilation_target = torch.compile(
+            self.model.t3._step_compilation_target, fullgraph=True, backend="cudagraphs"
+        )
+
+        # for i in range(2):
+        #     print(f"Compiling T3 {i + 1}/2")
+        #     list(self.model.generate("triggering torch compile by running the model"))
+
         torch.cuda.empty_cache()
+
+        print("Chatterbox model loaded and compiled.")
         
         
         # ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
@@ -431,16 +475,35 @@ class tts_class:
         device = "cuda"
         dtype = torch.float32
 
-        wav = self.model.generate(
-            text,
-            exaggeration=0.5,
-            cfg_weight=0.5,
-            temperature=temperature,
-            audio_prompt_path=None,
-        )
+        if voice and self.previous_voice != voice and self.previous_exaggaration != 0.5:
+            audio_path = self.model_path / "wavs" / voice
+            if audio_path.is_file():
+                self.model.prepare_conditionals(audio_path, exaggeration=0.5)
+                self.previous_voice = voice
+                self.previous_exaggaration = 0.5
+            else:
+                print(f"[{self.branding}ENG] \033[91mError\033[0m: Invalid voice {voice}.")
+            
+            
 
-        torchaudio.save(output_file, wav, self.model.sr)
-        
+        if streaming:
+            pass
+        else:
+            wavs = list(self.model.generate(
+                text,
+                exaggeration=0.5,
+                cfg_weight=0.5,
+                temperature=temperature,
+                audio_prompt_path=None,
+                max_new_tokens=500,
+            ))
+            if not wavs:
+                print(f"[{self.branding}ENG] \033[91mError\033[0m: No audio generated.")
+                return
+            full_wav = torch.cat(wavs, dim=-1)
+            torchaudio.save(output_file, full_wav, self.model.sr)
+
+
         
         wavs = None                                     # This is a fake function as this model doesnt stream but Python demands it otherwise it complains about await functions in the main script
         if streaming and wavs is not None:              # This is a fake function as this model doesnt stream but Python demands it otherwise it complains about await functions in the main script
